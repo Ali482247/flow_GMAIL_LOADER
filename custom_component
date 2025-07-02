@@ -1,0 +1,90 @@
+import base64
+import json
+import os
+from typing import Optional
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from langflow.custom import Component
+from langflow.schema import Message
+from langflow.io import (
+    FileInput,
+    Output,
+    TextInput
+)
+
+class GmailReaderComponent(Component):
+    display_name = "Gmail Reader"
+    description = "Reads the latest unread email using a Gmail service account."
+    icon = "mail"
+
+    inputs = [
+        FileInput(
+            name="credentials_json",
+            display_name="Service Account JSON",
+            file_types=[".json"],
+            required=True,
+            info="Upload your service account credentials JSON file"
+        ),
+        TextInput(
+            name="user_email",
+            display_name="Gmail Address (Workspace only)",
+            required=True,
+            placeholder="user@yourdomain.com",
+            info="Email to impersonate (needs domain-wide delegation)"
+        ),
+    ]
+
+    outputs = [
+        Output(
+            name="email_message",
+            display_name="Email Text",
+            method="read_latest_email",
+        ),
+    ]
+
+    def read_latest_email(self, credentials_json, user_email) -> Optional[Message]:
+        creds_data = json.loads(credentials_json.read())
+
+        scopes = ["https://www.googleapis.com/auth/gmail.readonly"]
+        credentials = service_account.Credentials.from_service_account_info(
+            creds_data, scopes=scopes
+        )
+
+        # Delegировать от имени пользователя (только Google Workspace)
+        delegated_creds = credentials.with_subject(user_email)
+        service = build("gmail", "v1", credentials=delegated_creds)
+
+        try:
+            results = (
+                service.users()
+                .messages()
+                .list(userId="me", labelIds=["INBOX"], q="is:unread", maxResults=1)
+                .execute()
+            )
+            messages = results.get("messages", [])
+            if not messages:
+                return Message(content="Нет новых писем.")
+
+            message_id = messages[0]["id"]
+            msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+
+            payload = msg["payload"]
+            parts = payload.get("parts", [])
+
+            body = ""
+            if "data" in payload.get("body", {}):
+                body = payload["body"]["data"]
+            elif parts:
+                for part in parts:
+                    if part["mimeType"] == "text/plain":
+                        body = part["body"]["data"]
+                        break
+
+            if body:
+                decoded = base64.urlsafe_b64decode(body).decode("utf-8")
+                return Message(content=decoded)
+            else:
+                return Message(content="Письмо не содержит текста.")
+        except Exception as e:
+            return Message(content=f"Ошибка при получении письма: {str(e)}")
